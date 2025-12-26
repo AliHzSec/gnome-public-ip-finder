@@ -1,0 +1,14 @@
+{
+  "description": "Displays information about your public IP Address and VPN status extension for the Gnome Shell",
+  "name": "IP Finder extension",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49"
+  ],
+  "url": "https://github.com/AliHzSec/gnome-public-ip-finder",
+  "uuid": "IP-Finder@AliHzSec.com",
+  "version": 1
+}
