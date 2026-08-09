@@ -2,18 +2,17 @@
     PANEL BUTTON STYLING
    ================================================================ */
 .ip-finder-panel-box {
-    /* padding: 4px 8px; */
     transition: all 0.2s ease;
 }
 
-/* Reduce spacing between panel elements */
-.ip-finder-panel-box .system-status-icon {
-    margin-left: 2px;
+/* IP address label */
+.ip-finder-ip-label {
+    padding: 0 2px;
 }
 
-/* First child shouldn't have left margin */
-.ip-finder-panel-box .system-status-icon:first-child {
-    margin-left: 0;
+/* Country flag label */
+.ip-finder-flag-label {
+    padding: 0 2px;
 }
 
 /* ================================================================
@@ -33,9 +32,12 @@
 }
 
 @keyframes pulse-glow {
-    0%, 100% {
+
+    0%,
+    100% {
         opacity: 1;
     }
+
     50% {
         opacity: 0.7;
     }

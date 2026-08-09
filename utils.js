@@ -1,116 +1,108 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import Soup from 'gi://Soup';
 
-Gio._promisify(Soup.Session.prototype, 'send_and_read_async');
+Gio._promisify(Gio.Subprocess.prototype, 'communicate_utf8_async', 'communicate_utf8_finish');
 
-// API configuration with fallback order
-// Only fetching IP address and country code to keep it lightweight
-const API_ENDPOINTS = [
-    {
-        name: 'ip-api.com',
-        url: 'http://ip-api.com/json?fields=query,countryCode',
-        fieldMap: {
-            ip: 'query',
-            countryCode: 'countryCode',
-        },
-    },
-    {
-        name: 'api.my-ip.io',
-        url: 'https://api.my-ip.io/v2/ip.json',
-        fieldMap: {
-            ip: 'ip',
-            countryCode: 'country.code',
-        },
-    },
-    {
-        name: 'ifconfig.co',
-        url: 'https://ifconfig.co/json',
-        fieldMap: {
-            ip: 'ip',
-            countryCode: 'country_iso',
-        },
-    },
-];
+// Cloudflare whoami DNS query configuration
+const DNS_SERVER = 'alex.ns.cloudflare.com';
+const QUERY_NAME = 'whoami.cloudflare.net';
+const QUERY_TYPE = 'TXT';
+
+// dig's own per-query timeout in seconds (see +time) and retry count (+tries)
+const DIG_TIMEOUT = 3;
+const DIG_TRIES = 1;
 
 /**
- * Get nested property value from object using dot notation
- * @param {object} obj - The object to search
- * @param {string} path - The path in dot notation (e.g., 'country.code')
- * @returns {any} The value or undefined
+ * Check whether the dig binary is available on the system
+ * @returns {string | null} Full path to dig or null when missing
  */
-function getNestedValue(obj, path) {
-    if (!path) return undefined;
-    return path.split('.').reduce((current, prop) => current?.[prop], obj);
+function findDig() {
+    return GLib.find_program_in_path('dig');
 }
 
 /**
- * Normalize API response to standard format
- * @param {object} rawData - Raw API response
- * @param {object} fieldMap - Field mapping configuration
- * @returns {object} Normalized data object
+ * Run the dig TXT query against Cloudflare's whoami service
+ * @param {string} digPath - Full path to the dig binary
+ * @returns {Promise<string>} Raw stdout of the dig command
  */
-function normalizeApiResponse(rawData, fieldMap) {
-    const normalized = {};
+async function runDigQuery(digPath) {
+    const proc = new Gio.Subprocess({
+        argv: [
+            digPath,
+            `@${DNS_SERVER}`,
+            QUERY_NAME,
+            QUERY_TYPE,
+            '+short',
+            `+time=${DIG_TIMEOUT}`,
+            `+tries=${DIG_TRIES}`,
+        ],
+        flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+    });
+    proc.init(null);
 
-    for (const [standardKey, apiKey] of Object.entries(fieldMap)) {
-        if (apiKey === null) {
-            normalized[standardKey] = null;
-        } else {
-            const value = getNestedValue(rawData, apiKey);
-            normalized[standardKey] = value !== undefined ? value : null;
-        }
+    const [stdout, stderr] = await proc.communicate_utf8_async(null, null);
+
+    if (!proc.get_successful()) {
+        // dig reports query errors (e.g. timeouts) on stdout as ';'-prefixed lines
+        const detail = (stderr || '').trim() ||
+            (stdout || '').split('\n').find(line => line.startsWith(';;'))?.replace(/^;;\s*/, '') ||
+            `dig exited with status ${proc.get_exit_status()}`;
+        throw new Error(shortenDigError(detail));
     }
 
-    return normalized;
+    return stdout;
 }
 
 /**
- * Fetch IP details with fallback to multiple API sources
- * Only fetches IP address and country code to minimize data transfer
- * @param {Soup.Session} session
- * @returns {{data: object | null, error: string | null, apiUsed: string | null}} object containing the data of the IP details or error message on fail
+ * Shorten verbose dig error messages so they fit in the panel
+ * @param {string} detail - Raw dig error message
+ * @returns {string} Shortened error message
  */
-export async function getIPDetails(session) {
-    const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+function shortenDigError(detail) {
+    if (/timed out/i.test(detail))
+        return 'DNS request timed out';
+    if (/no servers could be reached/i.test(detail))
+        return 'No DNS server reachable';
+    if (/network is unreachable/i.test(detail))
+        return 'Network unreachable';
+    return detail;
+}
 
-    let lastError = null;
+/**
+ * Parse dig +short output of the whoami.cloudflare.net TXT records
+ * Expected lines look like: "remote_ip: 203.0.113.10" and "country_code: DE"
+ * @param {string} output - Raw dig stdout
+ * @returns {{ip: string, countryCode: string | null}} Parsed IP details
+ */
+function parseWhoamiOutput(output) {
+    const ipMatch = output.match(/remote_ip:\s*([0-9a-fA-F.:]+)/);
+    const countryMatch = output.match(/country_code:\s*([A-Za-z]{2})/);
 
-    // Try each API in sequence
-    for (const api of API_ENDPOINTS) {
-        try {
-            console.log(`IP-Finder: Trying ${api.name}...`);
+    if (!ipMatch)
+        throw new Error('Unexpected DNS response');
 
-            const message = Soup.Message.new('GET', api.url);
-            message.request_headers.append('User-Agent', USER_AGENT);
+    return {
+        ip: ipMatch[1],
+        countryCode: countryMatch ? countryMatch[1].toUpperCase() : null,
+    };
+}
 
-            const bytes = await session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null);
+/**
+ * Fetch public IP details using a DNS TXT query to Cloudflare's whoami service
+ * @returns {Promise<{data: object | null, error: string | null}>} Object containing the IP details or an error message on failure
+ */
+export async function getIPDetails() {
+    try {
+        const digPath = findDig();
+        if (!digPath)
+            return { data: null, error: 'dig not found' };
 
-            // Check HTTP status code
-            if (message.status_code !== 200) {
-                console.log(`IP-Finder: ${api.name} returned status code ${message.status_code}, trying next API...`);
-                lastError = `${api.name} returned status ${message.status_code}`;
-                continue;
-            }
+        const output = await runDigQuery(digPath);
+        const data = parseWhoamiOutput(output);
 
-            // Parse response
-            const decoder = new TextDecoder('utf-8');
-            const rawData = JSON.parse(decoder.decode(bytes.get_data()));
-
-            // Normalize the response
-            const normalizedData = normalizeApiResponse(rawData, api.fieldMap);
-
-            console.log(`IP-Finder: Successfully fetched data from ${api.name}`);
-            return {data: normalizedData, apiUsed: api.name};
-
-        } catch (e) {
-            console.log(`IP-Finder: Error with ${api.name}: ${e}`);
-            lastError = `${api.name}: ${e.message || e}`;
-            continue;
-        }
+        return { data, error: null };
+    } catch (e) {
+        console.log(`IP-Finder: DNS query error: ${e.message || e}`);
+        return { data: null, error: e.message || 'DNS query failed' };
     }
-
-    // All APIs failed
-    console.log('IP-Finder: All API sources exhausted');
-    return {error: lastError || 'All API sources failed'};
 }

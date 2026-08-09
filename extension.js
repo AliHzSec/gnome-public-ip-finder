@@ -3,10 +3,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import NM from 'gi://NM';
-import Soup from 'gi://Soup';
 import St from 'gi://St';
 
-import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import { loadInterfaceXML } from 'resource:///org/gnome/shell/misc/fileUtils.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -26,6 +24,41 @@ const PortalHelperResult = {
 
 // Optimized refresh interval (in milliseconds)
 const REFRESH_DELAY = 1500;
+
+// Retry configuration for the DNS query
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1000;
+
+/**
+ * Get the system default interface font as a CSS style string
+ * @returns {string} CSS style with font-family and font-size, or empty string
+ */
+function getSystemFontStyle() {
+    try {
+        const settings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
+        const fontName = settings.get_string('font-name'); // e.g. 'Cantarell 11'
+        const match = fontName.match(/^(.*?)[\s,]+(\d+(?:\.\d+)?)$/);
+        if (match)
+            return `font-family: '${match[1].trim()}'; font-size: ${match[2]}pt;`;
+    } catch (e) {
+        console.error(`IP-Finder: Error reading system font: ${e}`);
+    }
+    return '';
+}
+
+/**
+ * Promise-based delay helper
+ * @param {number} ms - Delay in milliseconds
+ * @returns {Promise<void>}
+ */
+function delay(ms) {
+    return new Promise(resolve => {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        });
+    });
+}
 
 /**
  * Load flag emojis from countries.json
@@ -69,41 +102,39 @@ var IPFinderPanelButton = GObject.registerClass(
             // Load country flag mappings
             this._countryFlags = loadCountryFlags(this._extension.path);
 
-            // Setup Soup session for API calls
-            const SESSION_TYPE = GLib.getenv('XDG_SESSION_TYPE');
-            const PACKAGE_VERSION = Config.PACKAGE_VERSION;
-            const USER_AGENT = `User-Agent: Mozilla/5.0 (${SESSION_TYPE}; GNOME Shell/${PACKAGE_VERSION}; Linux ${GLib.getenv('CPU')};) IP_Finder/${this._extension.metadata.version}`;
-            this._session = new Soup.Session({ user_agent: USER_AGENT, timeout: 60 });
+            // Used to discard stale query results when a newer refresh starts
+            this._queryGeneration = 0;
 
-            // Create panel box layout
+            // Create panel box layout (styled like a panel status button)
             const panelBox = new St.BoxLayout({
-                x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.CENTER,
-                style_class: 'ip-finder-panel-box',
+                style_class: 'panel-status-menu-box panel-button-box ip-finder-panel-box',
+                style: 'spacing: 6px;',
             });
             this.add_child(panelBox);
 
             // VPN status icon
             this._vpnStatusIcon = new St.Icon({
                 icon_name: 'changes-allow-symbolic',
-                x_align: Clutter.ActorAlign.START,
+                icon_size: 16,
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'system-status-icon',
             });
             panelBox.add_child(this._vpnStatusIcon);
 
-            // IP Address label
+            // IP Address label (uses the system default font)
             this._ipAddressLabel = new St.Label({
                 text: 'Loading...',
                 y_align: Clutter.ActorAlign.CENTER,
-                style_class: 'system-status-icon',
+                style_class: 'ip-finder-ip-label',
+                style: getSystemFontStyle(),
             });
             panelBox.add_child(this._ipAddressLabel);
 
             // Status/loading icon (shown during loading)
             this._statusIcon = new St.Icon({
                 icon_name: 'network-wired-acquiring-symbolic',
-                x_align: Clutter.ActorAlign.START,
+                icon_size: 16,
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'system-status-icon',
             });
@@ -111,9 +142,8 @@ var IPFinderPanelButton = GObject.registerClass(
 
             // Country flag emoji
             this._flagIcon = new St.Label({
-                x_align: Clutter.ActorAlign.START,
                 y_align: Clutter.ActorAlign.CENTER,
-                style_class: 'system-status-icon',
+                style_class: 'ip-finder-flag-label',
                 visible: false,
             });
             panelBox.add_child(this._flagIcon);
@@ -169,7 +199,8 @@ var IPFinderPanelButton = GObject.registerClass(
         }
 
         _startGetIpInfo() {
-            this._session.abort();
+            // Invalidate any in-flight query so its result is discarded
+            this._queryGeneration++;
             this._removeGetIpInfoId();
             this._setAcquiringDetails();
 
@@ -268,6 +299,8 @@ var IPFinderPanelButton = GObject.registerClass(
         async _getIpInfo() {
             this._setAcquiringDetails();
 
+            const generation = this._queryGeneration;
+
             this._vpnConnectionOn = false;
 
             if (this._client.connectivity === NM.ConnectivityState.NONE) {
@@ -291,9 +324,28 @@ var IPFinderPanelButton = GObject.registerClass(
                 return;
             }
 
-            // Fetch IP details using multi-API fallback
-            const { data, error } = await Utils.getIPDetails(this._session);
-            this._setIpDetails(data, error);
+            // Fetch IP details via DNS query, retrying up to MAX_ATTEMPTS times
+            let lastError = 'Unknown error';
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                const { data, error } = await Utils.getIPDetails();
+
+                // A newer refresh was requested while querying, discard this result
+                if (generation !== this._queryGeneration)
+                    return;
+
+                if (data) {
+                    this._setIpDetails(data);
+                    return;
+                }
+
+                lastError = error || 'Unknown error';
+                console.log(`IP-Finder: Attempt ${attempt}/${MAX_ATTEMPTS} failed: ${lastError}`);
+
+                if (attempt < MAX_ATTEMPTS)
+                    await delay(RETRY_DELAY_MS);
+            }
+
+            this._setIpDetails(null, lastError);
         }
 
         _setAcquiringDetails() {
@@ -307,7 +359,7 @@ var IPFinderPanelButton = GObject.registerClass(
         _setIpDetails(data, error) {
             // Handle error or no connection
             if (!data) {
-                this._ipAddressLabel.text = error ? 'Error' : 'No Connection';
+                this._ipAddressLabel.text = error ? `⚠ ${error}` : 'No Connection';
                 this._statusIcon.show();
                 this._statusIcon.icon_name = 'network-offline-symbolic';
                 this._flagIcon.hide();
@@ -339,9 +391,9 @@ var IPFinderPanelButton = GObject.registerClass(
         }
 
         disable() {
+            this._queryGeneration++;
             this._removeGetIpInfoId();
             this._client?.disconnectObject(this);
-            this._session = null;
         }
     });
 
