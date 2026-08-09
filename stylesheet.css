@@ -1,23 +1,54 @@
-/* ================================================================
-    PANEL BUTTON STYLING
-   ================================================================ */
+/* Panel container: colors, shape and spacing.
+   Vertical centering of the shield icon, IP label and flag is done in
+   JavaScript via Clutter.ActorAlign.CENTER on the box and every child.
+   Spacing and icon-size live in JavaScript (they are valid St properties but
+   the generic CSS linter does not recognise them). */
 .ip-finder-panel-box {
     transition: all 0.2s ease;
+    background-color: rgba(30, 30, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 24px;
+    padding: 2px 12px;
+    margin: 0 10px;
 }
 
-/* IP address label */
+/* Design B: the whole pill border reflects the VPN state.
+   Full 'border' shorthand is used so it works even where St ignores a
+   standalone 'border-color'. Classes are toggled from extension.js. */
+.ip-finder-panel-box.ip-finder-vpn-on {
+    border: 1px solid #08835a;
+}
+
+.ip-finder-panel-box.ip-finder-vpn-off {
+    border: 1px solid #f12020;
+}
+
+/* Kill GNOME Shell's own built-in hover/focus/active highlight on the
+   PanelMenu.Button actor itself (the outer '.panel-button' class it applies
+   automatically). Without this, hovering shows a second, faint rounded box
+   drawn by the shell on top of our pill. The extra 'ip-finder-button' class
+   is added to the button in extension.js so this only affects our widget. */
+.panel-button.ip-finder-button:hover,
+.panel-button.ip-finder-button:focus,
+.panel-button.ip-finder-button:active {
+    background-color: transparent;
+    box-shadow: none;
+}
+
+/* Monospace IP: Victor Mono (bundled with the extension) with a fallback to
+   the system default monospace family if it cannot be loaded.
+   Size is injected from JS so it matches the system font size. */
 .ip-finder-ip-label {
-    padding: 0 2px;
+    font-family: 'Victor Mono', monospace;
+    padding: 0;
+    margin: 0;
 }
 
-/* Country flag label */
 .ip-finder-flag-label {
-    padding: 0 2px;
+    padding: 0;
+    margin: 0;
 }
 
-/* ================================================================
-    VPN STATUS STYLING
-   ================================================================ */
 .ip-info-vpn-on {
     color: #08835a;
 }
@@ -26,7 +57,11 @@
     color: #f12020;
 }
 
-/* Subtle pulse animation when VPN is connected */
+.ip-finder-panel-box .system-status-icon {
+    padding: 0;
+    margin: 0;
+}
+
 .ip-finder-panel-box .ip-info-vpn-on.system-status-icon {
     animation: pulse-glow 2s ease-in-out infinite;
 }

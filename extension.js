@@ -29,21 +29,117 @@ const REFRESH_DELAY = 1500;
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1000;
 
+// Bundled font: family name and the directory (relative to the extension)
+// that contains the .ttf files.
+const BUNDLED_FONT_FAMILY = 'Victor Mono';
+const BUNDLED_FONT_SUBDIR = 'fonts/VictorMono';
+
+// Preferred shield icons for the VPN state, most-preferred first. Different
+// icon themes ship different names, so the actual icon is resolved at runtime
+// against the current theme, falling back to the padlock icons if needed.
+const VPN_ICON_ON_CANDIDATES = [
+    'security-high-symbolic',
+    'network-vpn-symbolic',
+    'channel-secure-symbolic',
+    'changes-prevent-symbolic',
+];
+const VPN_ICON_OFF_CANDIDATES = [
+    'security-low-symbolic',
+    'network-vpn-disabled-symbolic',
+    'channel-insecure-symbolic',
+    'changes-allow-symbolic',
+];
+
 /**
- * Get the system default interface font as a CSS style string
- * @returns {string} CSS style with font-family and font-size, or empty string
+ * Resolve the first icon name that exists in the current icon theme.
+ * @param {string[]} candidates - Icon names ordered by preference
+ * @param {string} fallback - Name to use if none of the candidates exist
+ * @param {St.IconTheme|null} theme - Icon theme to query, or null
+ * @returns {string} A usable icon name
  */
-function getSystemFontStyle() {
+function resolveIcon(candidates, fallback, theme) {
+    if (theme) {
+        for (const name of candidates) {
+            try {
+                if (theme.has_icon(name))
+                    return name;
+            } catch (e) {
+                // Ignore and try the next candidate
+            }
+        }
+    }
+    return fallback;
+}
+
+/**
+ * Get only the system interface font size as a CSS style string.
+ * The IP label uses Victor Mono (from CSS) but should match the system font
+ * size; the flag label reuses it so the emoji scales to the text.
+ * @returns {string} e.g. 'font-size: 11pt;' or empty string
+ */
+function getSystemFontSizeStyle() {
     try {
         const settings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
         const fontName = settings.get_string('font-name'); // e.g. 'Cantarell 11'
         const match = fontName.match(/^(.*?)[\s,]+(\d+(?:\.\d+)?)$/);
         if (match)
-            return `font-family: '${match[1].trim()}'; font-size: ${match[2]}pt;`;
+            return `font-size: ${match[2]}pt;`;
     } catch (e) {
         console.error(`IP-Finder: Error reading system font: ${e}`);
     }
     return '';
+}
+
+/**
+ * Copy the bundled fonts into the user font directory (idempotently) and
+ * refresh the font cache so Pango can resolve them. If Victor Mono is still
+ * unavailable, the CSS font stack falls back to the system monospace font.
+ * @param {string} extensionPath - Path to the extension directory
+ */
+function installBundledFonts(extensionPath) {
+    try {
+        const srcDir = Gio.File.new_for_path(
+            GLib.build_filenamev([extensionPath, ...BUNDLED_FONT_SUBDIR.split('/')]));
+        if (!srcDir.query_exists(null))
+            return;
+
+        const destDirPath = GLib.build_filenamev(
+            [GLib.get_home_dir(), '.local', 'share', 'fonts']);
+        const destDir = Gio.File.new_for_path(destDirPath);
+        try {
+            destDir.make_directory_with_parents(null);
+        } catch (e) {
+            // Directory already exists: ignore
+        }
+
+        let copiedAny = false;
+        const enumerator = srcDir.enumerate_children(
+            'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        let info;
+        while ((info = enumerator.next_file(null)) !== null) {
+            const name = info.get_name();
+            if (!name.toLowerCase().endsWith('.ttf'))
+                continue;
+            const dest = destDir.get_child(name);
+            if (dest.query_exists(null))
+                continue;
+            srcDir.get_child(name).copy(dest, Gio.FileCopyFlags.NONE, null, null);
+            copiedAny = true;
+        }
+        enumerator.close(null);
+
+        if (copiedAny) {
+            const fcCache = GLib.find_program_in_path('fc-cache');
+            if (fcCache) {
+                const proc = Gio.Subprocess.new(
+                    [fcCache, '-f', destDirPath],
+                    Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
+                proc.wait_async(null, null);
+            }
+        }
+    } catch (e) {
+        console.error(`IP-Finder: Error installing bundled fonts: ${e}`);
+    }
 }
 
 /**
@@ -94,42 +190,72 @@ function getFlagEmoji(countryCode, flagMap) {
 var IPFinderPanelButton = GObject.registerClass(
     class IPFinderPanelButton extends PanelMenu.Button {
         _init(extension) {
-            // Initialize PanelMenu.Button with no menu (false)
-            super._init(0.5, 'IP-Finder', false);
+            // Initialize PanelMenu.Button. Pass true to skip creating a menu:
+            // there is none, and skipping it stops the shell's default press
+            // handler from toggling an empty popup and swallowing our clicks.
+            super._init(0.5, 'IP-Finder', true);
+
+            // Scopes the hover/focus/active override in stylesheet.css to
+            // just this button, so GNOME Shell's default panel-button
+            // highlight doesn't show a second border on hover.
+            this.add_style_class_name('ip-finder-button');
 
             this._extension = extension;
+
+            // Set once we have a valid IP; used by the click-to-copy handler.
+            // Stays null while loading, on error, or with no connection.
+            this._currentIp = null;
+
+            // Make the bundled monospace font available (idempotent).
+            installBundledFonts(this._extension.path);
 
             // Load country flag mappings
             this._countryFlags = loadCountryFlags(this._extension.path);
 
+            // Resolve the best available shield icons for this icon theme.
+            let iconTheme = null;
+            try {
+                iconTheme = new St.IconTheme();
+            } catch (e) {
+                console.error(`IP-Finder: Could not create icon theme: ${e}`);
+            }
+            this._vpnIconOn = resolveIcon(VPN_ICON_ON_CANDIDATES, 'changes-prevent-symbolic', iconTheme);
+            this._vpnIconOff = resolveIcon(VPN_ICON_OFF_CANDIDATES, 'changes-allow-symbolic', iconTheme);
+
+            // Cache the system font size; shared by the IP and flag labels so
+            // the row height stays consistent and the items stay aligned.
+            this._fontSizeStyle = getSystemFontSizeStyle();
+
             // Used to discard stale query results when a newer refresh starts
             this._queryGeneration = 0;
 
-            // Create panel box layout (styled like a panel status button)
-            const panelBox = new St.BoxLayout({
+            // Create panel box layout (styled like a panel status button).
+            // Kept on `this` so its VPN-state border class can be toggled.
+            // 'spacing' is a valid St.BoxLayout property set inline here.
+            this._panelBox = new St.BoxLayout({
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'panel-status-menu-box panel-button-box ip-finder-panel-box',
-                style: 'spacing: 6px;',
+                style: 'spacing: 12px;',
             });
-            this.add_child(panelBox);
+            this.add_child(this._panelBox);
 
-            // VPN status icon
+            // VPN status icon (shield)
             this._vpnStatusIcon = new St.Icon({
-                icon_name: 'changes-allow-symbolic',
+                icon_name: this._vpnIconOff,
                 icon_size: 16,
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'system-status-icon',
             });
-            panelBox.add_child(this._vpnStatusIcon);
+            this._panelBox.add_child(this._vpnStatusIcon);
 
-            // IP Address label (uses the system default font)
+            // IP Address label (Victor Mono via CSS, system font size via style)
             this._ipAddressLabel = new St.Label({
                 text: 'Loading...',
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'ip-finder-ip-label',
-                style: getSystemFontStyle(),
+                style: this._fontSizeStyle,
             });
-            panelBox.add_child(this._ipAddressLabel);
+            this._panelBox.add_child(this._ipAddressLabel);
 
             // Status/loading icon (shown during loading)
             this._statusIcon = new St.Icon({
@@ -138,20 +264,29 @@ var IPFinderPanelButton = GObject.registerClass(
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'system-status-icon',
             });
-            panelBox.add_child(this._statusIcon);
+            this._panelBox.add_child(this._statusIcon);
 
-            // Country flag emoji
+            // Country flag emoji. Reuse the system font size so the emoji is
+            // scaled to match the text height instead of the default size.
             this._flagIcon = new St.Label({
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'ip-finder-flag-label',
+                style: this._fontSizeStyle,
                 visible: false,
             });
-            panelBox.add_child(this._flagIcon);
+            this._panelBox.add_child(this._flagIcon);
 
-            // Override the default click behavior to just refresh IP
+            // Left click: silently copy the current IP to the clipboard.
+            // Right click: manually trigger a refresh. The automatic refresh
+            // mechanism is untouched; this only adds an on-demand refresh.
+            // No notification or visual feedback is shown for the copy.
             this.connect('button-press-event', (actor, event) => {
-                // Only handle left clicks
-                if (event.get_button() === 1) {
+                const button = event.get_button();
+                if (button === 1) {
+                    this._copyCurrentIpToClipboard();
+                    return Clutter.EVENT_STOP;
+                }
+                if (button === 3) {
                     this._startGetIpInfo();
                     return Clutter.EVENT_STOP;
                 }
@@ -160,6 +295,30 @@ var IPFinderPanelButton = GObject.registerClass(
 
             // Initialize network connectivity
             NM.Client.new_async(null, this.establishNetworkConnectivity.bind(this));
+        }
+
+        /**
+         * Silently copy the current IP address to the clipboard. No-op if
+         * no valid IP is currently displayed (loading, error, no connection).
+         */
+        _copyCurrentIpToClipboard() {
+            if (!this._currentIp)
+                return;
+            St.Clipboard.get_default().set_text(
+                St.ClipboardType.CLIPBOARD, this._currentIp);
+        }
+
+        /**
+         * Toggle the pill border color to reflect the VPN state (design B).
+         * @param {('on'|'off'|null)} state - VPN state, or null to clear.
+         */
+        _setVpnBorderState(state) {
+            this._panelBox.remove_style_class_name('ip-finder-vpn-on');
+            this._panelBox.remove_style_class_name('ip-finder-vpn-off');
+            if (state === 'on')
+                this._panelBox.add_style_class_name('ip-finder-vpn-on');
+            else if (state === 'off')
+                this._panelBox.add_style_class_name('ip-finder-vpn-off');
         }
 
         establishNetworkConnectivity(obj, result) {
@@ -354,6 +513,10 @@ var IPFinderPanelButton = GObject.registerClass(
             this._ipAddressLabel.text = 'Loading...';
             this._statusIcon.icon_name = 'network-wired-acquiring-symbolic';
             this._vpnStatusIcon.hide();
+            // Neutral border while state is unknown.
+            this._setVpnBorderState(null);
+            // No valid IP to copy while loading.
+            this._currentIp = null;
         }
 
         _setIpDetails(data, error) {
@@ -364,6 +527,9 @@ var IPFinderPanelButton = GObject.registerClass(
                 this._statusIcon.icon_name = 'network-offline-symbolic';
                 this._flagIcon.hide();
                 this._vpnStatusIcon.hide();
+                this._setVpnBorderState(null);
+                // No valid IP to copy on error / no connection.
+                this._currentIp = null;
                 return;
             }
 
@@ -372,6 +538,7 @@ var IPFinderPanelButton = GObject.registerClass(
 
             // Update IP address
             this._ipAddressLabel.text = data.ip;
+            this._currentIp = data.ip;
 
             // Update flag emoji
             const flagEmoji = getFlagEmoji(data.countryCode, this._countryFlags);
@@ -382,12 +549,12 @@ var IPFinderPanelButton = GObject.registerClass(
                 this._flagIcon.hide();
             }
 
-            // Update VPN icon
+            // Update shield icon and pill border to reflect the VPN state
             this._vpnStatusIcon.visible = true;
-            this._vpnStatusIcon.icon_name = this._vpnConnectionOn ?
-                'changes-prevent-symbolic' : 'changes-allow-symbolic';
+            this._vpnStatusIcon.icon_name = this._vpnConnectionOn ? this._vpnIconOn : this._vpnIconOff;
             this._vpnStatusIcon.style_class = this._vpnConnectionOn ?
                 'system-status-icon ip-info-vpn-on' : 'system-status-icon ip-info-vpn-off';
+            this._setVpnBorderState(this._vpnConnectionOn ? 'on' : 'off');
         }
 
         disable() {
